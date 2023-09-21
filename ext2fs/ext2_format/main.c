@@ -38,9 +38,9 @@ void fill_rand(unsigned char *buf)
 	n=16;
 	do
 	{
-		*buf=rand();
-		--n;
-		++buf;
+		while(rand_s(buf));
+		n-=4;
+		buf+=4;
 	}
 	while(n);
 }
@@ -49,7 +49,6 @@ int init_fs_info(void)
 	unsigned long x;
 	unsigned int nb[3];
 	int has_super;
-	srand(time(NULL));
 	sb.block_size=2;
 	sb.frag_size=2;
 	sb.blocks_per_group=32768;
@@ -324,6 +323,7 @@ void write_first_group(void)
 	struct ext2_inode inode;
 	unsigned char buf[12];
 	struct ext2_directory *dir;
+	unsigned long ctime,ctime_extra;
 	SetFilePointerEx(dev_handle,1024,NULL,FILE_BEGIN);
 	buf_write(&sb,1024);
 	buf_write_zero(2048);
@@ -343,8 +343,19 @@ void write_first_group(void)
 	inode.size=4096;
 	inode.blocks=8;
 	inode.block[0]=1+gt_blocks+1+1+512;
-	buf_write(&inode,128);
-	buf_write_zero(128+256*8190);
+	ctime=time(NULL);
+	ctime_extra=ctime>>32&3;
+	ctime&=0xffffffff;
+	inode.atime=ctime;
+	inode.ctime=ctime;
+	inode.mtime=ctime;
+	inode.crtime=ctime;
+	inode.atime_extra=ctime_extra;
+	inode.ctime_extra=ctime_extra;
+	inode.mtime_extra=ctime_extra;
+	inode.crtime_extra=ctime_extra;
+	buf_write(&inode,sizeof(inode));
+	buf_write_zero(256-sizeof(inode)+256*8190);
 	memset(buf,0,12);
 	dir=(void *)buf;
 	dir->inode=2;

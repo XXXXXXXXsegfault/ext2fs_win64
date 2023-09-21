@@ -84,6 +84,12 @@ struct ext2_inode
 	unsigned int dir_acl;
 	unsigned int faddr;
 	unsigned int osd2[3];
+	unsigned int rsv1;
+	unsigned int ctime_extra;
+	unsigned int mtime_extra;
+	unsigned int atime_extra;
+	unsigned int crtime;
+	unsigned int crtime_extra;
 };
 struct ext2_directory
 {

@@ -118,6 +118,7 @@ struct ext2_file *ext2_file_load(unsigned int ninode,unsigned int write,unsigned
 {
 	unsigned char buf[4096];
 	struct ext2_file *file;
+	unsigned long ctime,ctime_extra;
 	unsigned int inode_group,inode_off,inode_block;
 	if(ninode==0||ninode>ext2_sb->inodes)
 	{
@@ -134,13 +135,32 @@ struct ext2_file *ext2_file_load(unsigned int ninode,unsigned int write,unsigned
 	inode_off=(ninode-1)%ext2_sb->inodes_per_group*ext2_sb->inode_size;
 	inode_block=(inode_off>>ext2_sb->block_size+10)+ext2_bgdt_array[inode_group].inode_table;
 	inode_off&=(1<<ext2_sb->block_size+10)-1;
+	ctime=time(NULL);
+	ctime_extra=ctime>>32&3;
+	ctime&=0xffffffff;
 	ext2_read_block(inode_block,buf);
 	if(!create)
 	{
-		memcpy(&file->inode,buf+inode_off,128);
+		if(ext2_sb->inode_size<sizeof(struct ext2_inode))
+		{
+			memset(&file->inode,0,sizeof(struct ext2_inode));
+			memcpy(&file->inode,buf+inode_off,ext2_sb->inode_size);
+		}
+		else
+		{
+			memcpy(&file->inode,buf+inode_off,sizeof(struct ext2_inode));
+		}
 	}
 	else
 	{
+		file->inode.atime=ctime;
+		file->inode.ctime=ctime;
+		file->inode.mtime=ctime;
+		file->inode.crtime=ctime;
+		file->inode.atime_extra=ctime_extra;
+		file->inode.ctime_extra=ctime_extra;
+		file->inode.mtime_extra=ctime_extra;
+		file->inode.crtime_extra=ctime_extra;
 		memset(buf+inode_off,0,ext2_sb->inode_size);
 		ext2_write_block(inode_block,buf);
 	}
@@ -165,7 +185,14 @@ void ext2_file_release(struct ext2_file *file)
 	inode_block=(inode_off>>ext2_sb->block_size+10)+ext2_bgdt_array[inode_group].inode_table;
 	inode_off&=(1<<ext2_sb->block_size+10)-1;
 	ext2_read_block(inode_block,buf);
-	memcpy(buf+inode_off,&file->inode,128);
+	if(ext2_sb->inode_size<sizeof(struct ext2_inode))
+	{
+		memcpy(buf+inode_off,&file->inode,ext2_sb->inode_size);
+	}
+	else
+	{
+		memcpy(buf+inode_off,&file->inode,sizeof(struct ext2_inode));
+	}
 	ext2_write_block(inode_block,buf);
 	n=0;
 	while(n<6)
@@ -324,6 +351,7 @@ int ext2_file_read(struct ext2_file *file,unsigned long off,void *buf,unsigned i
 	unsigned int bn,block,ret,size1;
 	unsigned long fsize;
 	unsigned char buf2[4096];
+	unsigned long ctime,ctime_extra;
 	fsize=ext2_file_size_get(file);
 	if(off>=fsize)
 	{
@@ -358,6 +386,11 @@ int ext2_file_read(struct ext2_file *file,unsigned long off,void *buf,unsigned i
 		buf=(char *)buf+size1;
 		off=0;
 	}
+	ctime=time(NULL);
+	ctime_extra=ctime>>32&3;
+	ctime&=0xffffffff;
+	file->inode.atime=ctime;
+	file->inode.atime_extra=ctime_extra;
 	return ret;
 }
 unsigned int ext2_inode_alloc_group(unsigned int group)
@@ -813,6 +846,7 @@ int ext2_file_write(struct ext2_file *file,unsigned long off,void *buf,unsigned 
 	unsigned int bn,block,ret,size1;
 	unsigned long fsize,start;
 	unsigned char buf2[4096];
+	unsigned long ctime,ctime_extra;
 	fsize=ext2_file_size_get(file);
 	start=off;
 	bn=off>>ext2_sb->block_size+10;
@@ -849,6 +883,13 @@ int ext2_file_write(struct ext2_file *file,unsigned long off,void *buf,unsigned 
 	{
 		ext2_file_size_set(file,start+ret);
 	}
+	ctime=time(NULL);
+	ctime_extra=ctime>>32&3;
+	ctime&=0xffffffff;
+	file->inode.atime=ctime;
+	file->inode.ctime=ctime;
+	file->inode.atime_extra=ctime_extra;
+	file->inode.ctime_extra=ctime_extra;
 	return ret;
 }
 void ext2_sync(void)
