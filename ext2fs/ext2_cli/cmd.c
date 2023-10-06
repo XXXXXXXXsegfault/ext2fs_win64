@@ -8,7 +8,7 @@ void cmd_help(int argc,char **argv)
 		{
 			puts("Usage:\n");
 			puts("help -- display list of commands\n");
-			puts("help <command> -- display information about specific command\n");
+			puts("help <command> -- display information about a specific command\n");
 			return;
 		}
 		if(!strcmp(argv[1],"exit"))
@@ -21,13 +21,13 @@ void cmd_help(int argc,char **argv)
 		{
 			puts("Usage:\n");
 			puts("ls -- list files in the current directory\n");
-			puts("ls <dir> -- list files in specific directory\n");
+			puts("ls <dir> -- list files\n");
 			return;
 		}
 		if(!strcmp(argv[1],"cd"))
 		{
 			puts("Usage:\n");
-			puts("cd <dir> -- switch to specific directory\n");
+			puts("cd <dir> -- change current directory\n");
 			return;
 		}
 		if(!strcmp(argv[1],"pwd"))
@@ -57,7 +57,7 @@ void cmd_help(int argc,char **argv)
 		if(!strcmp(argv[1],"du"))
 		{
 			puts("Usage:\n");
-			puts("du <name> -- display file space usage\n");
+			puts("du <name> -- display space usage of file or directory\n");
 			return;
 		}
 		if(!strcmp(argv[1],"remove"))
@@ -77,9 +77,9 @@ void cmd_help(int argc,char **argv)
 	}
 	puts("Commands:\n");
 	puts("cd -- change current directory\n");
-	puts("du -- display file space usage\n");
+	puts("du -- display storage space usage\n");
 	puts("exit -- save changes and exit\n");
-	puts("help -- display list of commands or information about specific command\n");
+	puts("help -- display list of commands or information about a specific command\n");
 	puts("ls -- list files\n");
 	puts("mkdir -- create directory\n");
 	puts("move -- rename or move file\n");
