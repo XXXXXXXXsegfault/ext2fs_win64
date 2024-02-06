@@ -24,7 +24,7 @@ void fatal_error(char *str)
 {
 	puts("Fatal Error: ");
 	puts(str);
-	puts("\nPlease press any key to continue.\n");
+	puts("\nPlease press any key to continue. ");
 	getch();
 	exit(1);
 }

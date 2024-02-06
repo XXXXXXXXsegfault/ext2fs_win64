@@ -1,11 +1,13 @@
 #include "../include/ext2.c"
+#include "../include/crc.c"
 void *dev_handle;
 unsigned long dev_size;
 unsigned char ext2_superblock_data[4096];
 struct ext2_superblock *ext2_sb;
-struct ext2_bgdt *ext2_bgdt_array;
+unsigned long int ext2_desc_size;
+struct ext4_bgdt *ext2_bgdt_array;
 int ext2_bgdt_blocks;
-unsigned int ext2_groups;
+unsigned long ext2_groups;
 unsigned long read_raw_blocks(void *buf,unsigned long off,unsigned long size)
 {
 	unsigned int ret;
@@ -21,6 +23,10 @@ unsigned long read_raw_blocks(void *buf,unsigned long off,unsigned long size)
 	ReadFile(dev_handle,buf,size<<12,&ret,NULL);
 	if(ret!=size<<12)
 	{
+		char buf[20];
+		buf[0]=0;
+		sprinti(buf,size,1);
+		puts(buf);
 		fatal_error("I/O error while reading blocks");
 	}
 	return size;
@@ -48,6 +54,7 @@ unsigned long write_raw_blocks(void *buf,unsigned long off,unsigned long size)
 void ext2fs_init(char *name)
 {
 	unsigned long buf[128];
+	unsigned long blocks;
 	int n,block;
 	dev_handle=CreateFileA(name,GENERIC_READ|GENERIC_WRITE,0,NULL,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL);
 	if(dev_handle==INVALID_HANDLE_VALUE)
@@ -71,7 +78,7 @@ void ext2fs_init(char *name)
 		fatal_error("Cannot read superblock");
 	}
 	ext2_sb=(void *)(ext2_superblock_data+1024);
-	if(ext2_sb->magic!=0xef53||ext2_sb->blocks==0)
+	if(ext2_sb->magic!=0xef53||ext2_sb->blocks==0&&ext2_sb->blocks_hi==0)
 	{
 		fatal_error("Device does not contain an ext2 filesystem");
 	}
@@ -79,18 +86,32 @@ void ext2fs_init(char *name)
 	{
 		fatal_error("Unsupported block size");
 	}
+	if(ext2_sb->inode_size!=128&&ext2_sb->inode_size!=256)
+	{
+		fatal_error("Unsupported inode size");
+	}
 	if(ext2_sb->blocks_per_group>1<<ext2_sb->block_size+13||
 	ext2_sb->inodes_per_group>1<<ext2_sb->block_size+13)
 	{
 		fatal_error("Bad block or inode number");
 	}
-	if(ext2_sb->feature_incompat&~2||ext2_sb->feature_ro_compat&~3)
+	if(ext2_sb->feature_incompat&~0x2c2||ext2_sb->feature_ro_compat&~0x46b)
 	{
 		fatal_error("Filesystem has unsupported features");
 	}
 	cache_init();
-	ext2_groups=(ext2_sb->blocks-1)/ext2_sb->blocks_per_group+1;
-	ext2_bgdt_blocks=((ext2_groups*32-1)>>ext2_sb->block_size+10)+1;
+	blocks=(unsigned long)ext2_sb->blocks;
+	if(ext2_sb->feature_incompat&FEATURE_64BIT)
+	{
+		blocks+=(unsigned long)ext2_sb->blocks_hi<<32;
+	}
+	ext2_groups=(blocks-1)/ext2_sb->blocks_per_group+1;
+	ext2_desc_size=ext2_sb->desc_size;
+	if(ext2_desc_size<32)
+	{
+		ext2_desc_size=32;
+	}
+	ext2_bgdt_blocks=((ext2_groups*ext2_desc_size-1)>>ext2_sb->block_size+10)+1;
 	ext2_bgdt_array=xmalloc(ext2_bgdt_blocks<<ext2_sb->block_size+10);
 	n=0;
 	block=1;
@@ -100,26 +121,47 @@ void ext2fs_init(char *name)
 	}
 	while(n<ext2_bgdt_blocks)
 	{
-		ext2_read_block(block,ext2_bgdt_array+(n<<ext2_sb->block_size+5));
+		ext2_read_block(block,(char *)ext2_bgdt_array+(n<<ext2_sb->block_size+10));
 		++n;
 		++block;
 	}
 }
+unsigned long ext2_blocks(void)
+{
+	unsigned long val;
+	val=ext2_sb->blocks;
+	if(ext2_sb->feature_incompat&FEATURE_64BIT)
+	{
+		val|=(unsigned long)ext2_sb->blocks_hi<<32;
+	}
+	return val;
+}
 struct ext2_file
 {
-	unsigned int ninode;
-	unsigned int write;
+	unsigned long int ninode;
+	unsigned long int write;
 	struct ext2_inode inode;
-	unsigned int cache_write[6];
-	unsigned int cache_block[6];
+	unsigned long cache_write[6];
+	unsigned long cache_block[6];
+	unsigned long cache_crc[6];
+	unsigned long crc_seed;
 	unsigned int cache[1024*6];
 };
-struct ext2_file *ext2_file_load(unsigned int ninode,unsigned int write,unsigned int create)
+void block_update_crc(void *block,unsigned int init)
+{
+	unsigned int *crc;
+	unsigned int size;
+	size=(1<<ext2_sb->block_size+10)/12*12;
+	crc=(void *)((char *)block+size);
+	*crc=crc32(block,size,init);
+}
+struct ext2_file *ext2_file_load(unsigned long int ninode,unsigned long int write,unsigned long int create)
 {
 	unsigned char buf[4096];
 	struct ext2_file *file;
 	unsigned long ctime,ctime_extra;
-	unsigned int inode_group,inode_off,inode_block;
+	unsigned long inode_group,inode_off,inode_block;
+	
 	if(ninode==0||ninode>ext2_sb->inodes)
 	{
 		return NULL;
@@ -133,7 +175,13 @@ struct ext2_file *ext2_file_load(unsigned int ninode,unsigned int write,unsigned
 	memset(file,0,sizeof(*file));
 	inode_group=(ninode-1)/ext2_sb->inodes_per_group;
 	inode_off=(ninode-1)%ext2_sb->inodes_per_group*ext2_sb->inode_size;
-	inode_block=(inode_off>>ext2_sb->block_size+10)+ext2_bgdt_array[inode_group].inode_table;
+	struct ext4_bgdt *desc;
+	desc=(void *)((char *)ext2_bgdt_array+ext2_desc_size*inode_group);
+	inode_block=(inode_off>>ext2_sb->block_size+10)+desc->inode_table;
+	if(ext2_desc_size>=64)
+	{
+		inode_block+=(unsigned long)desc->inode_table_hi<<32;
+	}
 	inode_off&=(1<<ext2_sb->block_size+10)-1;
 	ctime=time(NULL);
 	ctime_extra=ctime>>32&3;
@@ -162,29 +210,91 @@ struct ext2_file *ext2_file_load(unsigned int ninode,unsigned int write,unsigned
 		file->inode.mtime_extra=ctime_extra;
 		file->inode.crtime_extra=ctime_extra;
 		memset(buf+inode_off,0,ext2_sb->inode_size);
+		if(ext2_sb->feature_incompat&FEATURE_EXTENTS)
+		{
+			file->inode.flags=FLAG_EXTENTS;
+			memcpy(file->inode.block,"\x0a\xf3\x00\x00\x04\x00\x00\x00",8);
+		}
 		ext2_write_block(inode_block,buf);
 	}
+	unsigned int crc;
+	crc=crc32(ext2_sb->uuid,16,0xffffffff);
+	crc=crc32(&ninode,4,crc);
+	crc=crc32(&file->inode.generation,4,crc);
+	if(ext2_sb->feature_incompat&FEATURE_EXTENTS)
+	{
+		file->cache_crc[0]=1;
+		file->cache_crc[1]=1;
+		file->cache_crc[2]=1;
+		file->cache_crc[3]=1;
+		file->cache_crc[4]=1;
+		file->cache_crc[5]=1;
+	}
+	file->crc_seed=crc;
 	file->ninode=ninode;
 	file->write=write;
 	return file;
 }
+void ext2_dir_write_csum(struct ext2_file *dir);
+void file_store_csum(struct ext2_file *file)
+{
+	int n;
+	n=0;
+	while(n<6)
+	{
+		if(file->cache_write[n])
+		{
+			if(file->cache_crc[n])
+			{
+				block_update_crc(file->cache+n*1024,file->crc_seed);
+			}
+			ext2_write_block(file->cache_block[n],file->cache+n*1024);
+		}
+		++n;
+	}
+}
 void ext2_file_release(struct ext2_file *file)
 {
 	unsigned char buf[4096];
-	unsigned int ninode;
-	unsigned int inode_group,inode_off,inode_block;
+	unsigned long int ninode;
+	unsigned long inode_group,inode_off,inode_block;
 	int n;
 	if(!file->write)
 	{
 		free(file);
 		return;
 	}
+	if((file->inode.mode&0170000)==040000)
+	{
+		ext2_dir_write_csum(file);
+	}
 	ninode=file->ninode;
 	inode_group=(ninode-1)/ext2_sb->inodes_per_group;
 	inode_off=(ninode-1)%ext2_sb->inodes_per_group*ext2_sb->inode_size;
-	inode_block=(inode_off>>ext2_sb->block_size+10)+ext2_bgdt_array[inode_group].inode_table;
+	struct ext4_bgdt *desc;
+	desc=(void *)((char *)ext2_bgdt_array+ext2_desc_size*inode_group);
+	inode_block=(inode_off>>ext2_sb->block_size+10)+desc->inode_table;
+	if(ext2_desc_size>=64)
+	{
+		inode_block+=(unsigned long)desc->inode_table_hi<<32;
+	}
 	inode_off&=(1<<ext2_sb->block_size+10)-1;
 	ext2_read_block(inode_block,buf);
+	if(ext2_sb->feature_ro_compat&FEATURE_METADATA_CSUM)
+	{
+		unsigned int csum;
+		csum=crc32(ext2_sb->uuid,16,0xffffffff);
+		csum=crc32(&ninode,4,csum);
+		csum=crc32(&file->inode.generation,4,csum);
+		file->inode.osd2[2]=0;
+		file->inode.checksum_hi&=0xffff;
+		csum=crc32(&file->inode,ext2_sb->inode_size,csum);
+		file->inode.osd2[2]=csum&0xffff;
+		if(file->inode.checksum_hi>=4)
+		{
+			file->inode.checksum_hi|=csum&0xffff0000;
+		}
+	}
 	if(ext2_sb->inode_size<sizeof(struct ext2_inode))
 	{
 		memcpy(buf+inode_off,&file->inode,ext2_sb->inode_size);
@@ -193,19 +303,13 @@ void ext2_file_release(struct ext2_file *file)
 	{
 		memcpy(buf+inode_off,&file->inode,sizeof(struct ext2_inode));
 	}
+	
+	
 	ext2_write_block(inode_block,buf);
-	n=0;
-	while(n<6)
-	{
-		if(file->cache_block[n])
-		{
-			ext2_write_block(file->cache_block[n],file->cache+n*1024);
-		}
-		++n;
-	}
+	file_store_csum(file);
 	free(file);
 }
-unsigned int ext2_file_block(struct ext2_file *file,unsigned int off)
+unsigned long int ext2_file_block_old(struct ext2_file *file,unsigned long int off)
 {
 	unsigned long n,n1,n2,off1,off2,off3;
 	if(off<12)
@@ -224,6 +328,10 @@ unsigned int ext2_file_block(struct ext2_file *file,unsigned int off)
 		{
 			if(file->cache_write[0]&&file->cache_block[0]!=0)
 			{
+				if(file->cache_crc[0])
+				{
+					block_update_crc(file->cache+0*1024,file->crc_seed);
+				}
 				ext2_write_block(file->cache_block[0],file->cache);
 				file->cache_write[0]=0;
 			}
@@ -246,6 +354,10 @@ unsigned int ext2_file_block(struct ext2_file *file,unsigned int off)
 		{
 			if(file->cache_write[1]&&file->cache_block[1]!=0)
 			{
+				if(file->cache_crc[1])
+				{
+					block_update_crc(file->cache+1*1024,file->crc_seed);
+				}
 				ext2_write_block(file->cache_block[1],file->cache+1024*1);
 				file->cache_write[1]=0;
 			}
@@ -261,6 +373,10 @@ unsigned int ext2_file_block(struct ext2_file *file,unsigned int off)
 		{
 			if(file->cache_write[2]&&file->cache_block[2]!=0)
 			{
+				if(file->cache_crc[2])
+				{
+					block_update_crc(file->cache+2*1024,file->crc_seed);
+				}
 				ext2_write_block(file->cache_block[2],file->cache+1024*2);
 				file->cache_write[2]=0;
 			}
@@ -284,6 +400,10 @@ unsigned int ext2_file_block(struct ext2_file *file,unsigned int off)
 		{
 			if(file->cache_write[3]&&file->cache_block[3]!=0)
 			{
+				if(file->cache_crc[3])
+				{
+					block_update_crc(file->cache+3*1024,file->crc_seed);
+				}
 				ext2_write_block(file->cache_block[3],file->cache+1024*3);
 				file->cache_write[3]=0;
 			}
@@ -299,6 +419,10 @@ unsigned int ext2_file_block(struct ext2_file *file,unsigned int off)
 		{
 			if(file->cache_write[4]&&file->cache_block[4]!=0)
 			{
+				if(file->cache_crc[4])
+				{
+					block_update_crc(file->cache+4*1024,file->crc_seed);
+				}
 				ext2_write_block(file->cache_block[4],file->cache+1024*4);
 				file->cache_write[4]=0;
 			}
@@ -314,6 +438,10 @@ unsigned int ext2_file_block(struct ext2_file *file,unsigned int off)
 		{
 			if(file->cache_write[5]&&file->cache_block[5]!=0)
 			{
+				if(file->cache_crc[5])
+				{
+					block_update_crc(file->cache+5*1024,file->crc_seed);
+				}
 				ext2_write_block(file->cache_block[5],file->cache+1024*5);
 				file->cache_write[5]=0;
 			}
@@ -323,6 +451,91 @@ unsigned int ext2_file_block(struct ext2_file *file,unsigned int off)
 		return file->cache[1024*5+off3];
 	}
 	return 0;
+}
+unsigned long int _ext2_file_block_extent(struct ext2_file *file,void *array,int entries,int depth,unsigned long int off)
+{
+	struct ext4_extent_header *eh;
+	struct ext4_extent *ee;
+	struct ext4_extent_index *ei;
+	int i;
+	unsigned long val;
+	if(depth>5)
+	{
+		return 0;
+	}
+	eh=array;
+	if(eh->magic!=0xf30a)
+	{
+		return 0;
+	}
+	if(eh->entries==0)
+	{
+		return 0;
+	}
+	if(eh->entries<entries)
+	{
+		entries=eh->entries;
+	}
+	ee=(void *)(eh+1);
+	i=1;
+	while(i<entries)
+	{
+		if(ee[i].lblock>off)
+		{
+			break;
+		}
+		++i;
+	}
+	--i;
+	if(eh->depth)
+	{
+		ei=(void *)(ee+i);
+		val=ei->block_hi&0xffff;
+		val=val<<32|ei->block_lo;
+		if(val==0)
+		{
+			return 0;
+		}
+		if(file->cache_block[depth]!=val)
+		{
+			if(file->cache_write[depth])
+			{
+				if(file->cache_crc[depth])
+				{
+					block_update_crc(file->cache+depth*1024,file->crc_seed);
+				}
+				file->cache_write[depth]=0;
+				ext2_write_block(file->cache_block[depth],file->cache+depth*1024);
+			}
+			ext2_read_block(val,file->cache+depth*1024);
+			file->cache_block[depth]=val;
+		}
+		return _ext2_file_block_extent(file,file->cache+depth*1024,(1<<ext2_sb->block_size+10)/12-1,depth+1,off);
+	}
+	else
+	{
+		ee+=i;
+		val=ee->start_hi;
+		val=val<<32|ee->start_lo;
+		if(off-ee->lblock>=ee->len)
+		{
+			return 0;
+		}
+		return off-ee->lblock+val;
+	}
+}
+unsigned long int ext2_file_block_extent(struct ext2_file *file,unsigned long int off)
+{
+	return _ext2_file_block_extent(file,file->inode.block,4,0,off);
+}
+
+unsigned long ext2_file_block(struct ext2_file *file,unsigned long int off)
+{
+	if(ext2_sb->feature_incompat&FEATURE_EXTENTS&&file->inode.flags&FLAG_EXTENTS)
+	{
+		return ext2_file_block_extent(file,off);
+	}
+	return ext2_file_block_old(file,off);
 }
 unsigned long ext2_file_size_get(struct ext2_file *file)
 {
@@ -346,9 +559,9 @@ void ext2_file_size_set(struct ext2_file *file,unsigned long size)
 		file->inode.dir_acl=size>>32;
 	}
 }
-int ext2_file_read(struct ext2_file *file,unsigned long off,void *buf,unsigned int size)
+int ext2_file_read(struct ext2_file *file,unsigned long off,void *buf,unsigned long int size)
 {
-	unsigned int bn,block,ret,size1;
+	unsigned long int bn,block,ret,size1;
 	unsigned long fsize;
 	unsigned char buf2[4096];
 	unsigned long ctime,ctime_extra;
@@ -393,12 +606,29 @@ int ext2_file_read(struct ext2_file *file,unsigned long off,void *buf,unsigned i
 	file->inode.atime_extra=ctime_extra;
 	return ret;
 }
-unsigned int ext2_inode_alloc_group(unsigned int group)
+unsigned long int ext2_inode_alloc_group(unsigned long group)
 {
 	unsigned char buf[4096];
-	unsigned int ret;
+	unsigned long int ret;
+	unsigned long val;
 	int n;
-	ext2_read_block(ext2_bgdt_array[group].inode_bitmap,buf);
+	struct ext4_bgdt *desc;
+	desc=(void *)((char *)ext2_bgdt_array+ext2_desc_size*group);
+	val=desc->inode_bitmap;
+	if(ext2_desc_size>=64)
+	{
+		val+=(unsigned long)desc->inode_bitmap_hi<<32;
+	}
+	if(desc->flags&0x1)
+	{
+		memset(buf,0xff,4096);
+		memset(buf,0,ext2_sb->inodes_per_group>>3);
+		desc->flags&=0xfffe;
+	}
+	else
+	{
+		ext2_read_block(desc->inode_bitmap,buf);
+	}
 	n=bitmap_find(buf,ext2_sb->inodes_per_group>>3);
 	if(n==-1)
 	{
@@ -410,14 +640,27 @@ unsigned int ext2_inode_alloc_group(unsigned int group)
 		return 0;
 	}
 	bitmap_set(buf,n);
-	ext2_write_block(ext2_bgdt_array[group].inode_bitmap,buf);
-	--ext2_bgdt_array[group].free_inodes;
+	ext2_write_block(val,buf);
+	if(desc->free_inodes==0&&ext2_desc_size>=64)
+	{
+		--desc->free_inodes_hi;
+	}
+	
+	--desc->free_inodes;
+	if(ext2_desc_size>=64||ext2_sb->feature_ro_compat&FEATURE_METADATA_CSUM)
+	{
+		if(desc->unused_inodes==0&&ext2_desc_size>=64)
+		{
+			--desc->unused_inodes_hi;
+		}
+		--desc->unused_inodes;
+	}
 	--ext2_sb->free_inodes;
 	return ret;
 }
-unsigned int ext2_inode_alloc(unsigned int dir_inode)
+unsigned long int ext2_inode_alloc(unsigned long dir_inode)
 {
-	unsigned int group,n;
+	unsigned long group,n;
 	if(dir_inode>ext2_sb->inodes)
 	{
 		fatal_error("Inode number out of range when allocating inode");
@@ -432,7 +675,9 @@ unsigned int ext2_inode_alloc(unsigned int dir_inode)
 		n=group;
 		do
 		{
-			if(ext2_bgdt_array[n].free_inodes)
+			struct ext4_bgdt *desc;
+			desc=(void *)((char *)ext2_bgdt_array+ext2_desc_size*n);
+			if(desc->free_inodes||ext2_desc_size>=64&&desc->free_inodes_hi)
 			{
 				return ext2_inode_alloc_group(n);
 			}
@@ -449,7 +694,15 @@ unsigned int ext2_inode_alloc(unsigned int dir_inode)
 		group=0;
 		while(group<ext2_groups)
 		{
-			if(ext2_bgdt_array[group].free_inodes>ext2_sb->free_inodes/ext2_groups)
+			struct ext4_bgdt *desc;
+			desc=(void *)((char *)ext2_bgdt_array+ext2_desc_size*group);
+			unsigned long value;
+			value=desc->free_inodes;
+			if(ext2_desc_size>=64)
+			{
+				value+=(unsigned long)desc->free_inodes_hi;
+			}
+			if(value)
 			{
 				return ext2_inode_alloc_group(group);
 			}
@@ -458,7 +711,15 @@ unsigned int ext2_inode_alloc(unsigned int dir_inode)
 		group=0;
 		while(group<ext2_groups)
 		{
-			if(ext2_bgdt_array[group].free_inodes)
+			struct ext4_bgdt *desc;
+			desc=(void *)((char *)ext2_bgdt_array+ext2_desc_size*group);
+			unsigned long value;
+			value=desc->free_inodes;
+			if(ext2_desc_size>=64)
+			{
+				value+=(unsigned long)desc->free_inodes_hi;
+			}
+			if(value)
 			{
 				return ext2_inode_alloc_group(group);
 			}
@@ -467,35 +728,96 @@ unsigned int ext2_inode_alloc(unsigned int dir_inode)
 	}
 	return 0;
 }
-void ext2_inode_release(unsigned int inode)
+void ext2_inode_release(unsigned long inode)
 {
-	unsigned int group;
+	unsigned long int group;
 	unsigned char buf[4096];
-	unsigned int n,block;
+	unsigned long int n,block;
 	if(inode==0||inode>ext2_sb->inodes)
 	{
 		fatal_error("Inode number out of range");
 	}
 	group=(inode-1)/ext2_sb->inodes_per_group;
 	n=(inode-1)%ext2_sb->inodes_per_group;
-	ext2_read_block(ext2_bgdt_array[group].inode_bitmap,buf);
+	struct ext4_bgdt *desc;
+	desc=(void *)((char *)ext2_bgdt_array+ext2_desc_size*group);
+	unsigned long value;
+	value=desc->inode_bitmap;
+	if(ext2_desc_size>=64)
+	{
+		value+=(unsigned long)desc->inode_bitmap_hi<<32;
+	}
+	ext2_read_block(value,buf);
 	bitmap_clr(buf,n);
-	ext2_write_block(ext2_bgdt_array[group].inode_bitmap,buf);
+	ext2_write_block(value,buf);
 	n*=ext2_sb->inode_size;
-	block=ext2_bgdt_array[group].inode_table+(n>>ext2_sb->block_size+10);
+	value=desc->inode_table;
+	if(ext2_desc_size>=64)
+	{
+		value+=(unsigned long)desc->inode_table_hi<<32;
+	}
+	block=value+(n>>ext2_sb->block_size+10);
 	n&=(1<<ext2_sb->block_size+10)-1;
 	ext2_read_block(block,buf);
 	memset(buf+n,0,ext2_sb->inode_size);
 	ext2_write_block(block,buf);
-	++ext2_bgdt_array[group].free_inodes;
+	++desc->free_inodes;
 	++ext2_sb->free_inodes;
+	if(ext2_desc_size>=64||ext2_sb->feature_ro_compat&FEATURE_METADATA_CSUM)
+	{
+		++desc->unused_inodes;
+		if(desc->unused_inodes==0&&ext2_desc_size>=64)
+		{
+			++desc->unused_inodes_hi;
+		}
+	}
+	if(ext2_desc_size>=64&&desc->free_inodes==0)
+	{
+		++desc->free_inodes;
+	}
 }
-unsigned int ext2_block_alloc_group(unsigned int group)
+unsigned long int ext2_block_alloc_group(unsigned long group)
 {
 	unsigned char buf[4096];
-	unsigned int ret;
+	unsigned long int ret;
 	int n;
-	ext2_read_block(ext2_bgdt_array[group].block_bitmap,buf);
+	struct ext4_bgdt *desc;
+	desc=(void *)((char *)ext2_bgdt_array+ext2_desc_size*group);
+	unsigned long value,value2;
+	value=desc->block_bitmap;
+	if(ext2_desc_size>=64)
+	{
+		value+=(unsigned long)desc->block_bitmap_hi<<32;
+	}
+	if(desc->flags&0x2)
+	{
+		memset(buf,0xff,4096);
+		memset(buf,0,ext2_sb->blocks_per_group>>3);
+		value2=desc->free_blocks;
+		if(ext2_desc_size>=64)
+		{
+			value2+=(unsigned long)desc->free_blocks_hi<<16;
+		}
+		if(group==ext2_groups-1&&ext2_blocks()%ext2_sb->blocks_per_group)
+		{
+			value2=ext2_blocks()%ext2_sb->blocks_per_group-value2;
+		}
+		else
+		{
+			value2=ext2_sb->blocks_per_group-value2;
+		}
+		if(value2>8<<ext2_sb->block_size+10)
+		{
+			value2=8<<ext2_sb->block_size+10;
+		}
+		memset(buf,0xff,value2>>3);
+		buf[value2>>3]|=(1<<(value2&7))-1;
+		desc->flags&=0xfffd;
+	}
+	else
+	{
+		ext2_read_block(value,buf);
+	}
 	n=bitmap_find(buf,ext2_sb->blocks_per_group>>3);
 	if(n==-1)
 	{
@@ -506,19 +828,27 @@ unsigned int ext2_block_alloc_group(unsigned int group)
 	{
 		++ret;
 	}
-	if(ret>=ext2_sb->blocks)
+	if(ret>=ext2_blocks())
 	{
 		return 0;
 	}
 	bitmap_set(buf,n);
-	ext2_write_block(ext2_bgdt_array[group].block_bitmap,buf);
-	--ext2_bgdt_array[group].free_blocks;
+	ext2_write_block(value,buf);
+	if(desc->free_blocks==0&&ext2_desc_size>=64)
+	{
+		--desc->free_blocks_hi;
+	}
+	--desc->free_blocks;
+	if(ext2_sb->free_blocks==0)
+	{
+		--ext2_sb->free_blocks_hi;
+	}
 	--ext2_sb->free_blocks;
 	return ret;
 }
-unsigned int ext2_block_alloc(unsigned int inode)
+unsigned long int ext2_block_alloc(unsigned long inode)
 {
-	unsigned int group,n;
+	unsigned long group,n;
 	if(inode==0||inode>ext2_sb->inodes)
 	{
 		fatal_error("Inode number out of range when allocating block");
@@ -531,7 +861,15 @@ unsigned int ext2_block_alloc(unsigned int inode)
 	n=group;
 	do
 	{
-		if(ext2_bgdt_array[n].free_blocks)
+		struct ext4_bgdt *desc;
+		desc=(void *)((char *)ext2_bgdt_array+ext2_desc_size*n);
+		unsigned long value;
+		value=desc->free_blocks;
+		if(ext2_desc_size>=64)
+		{
+			value+=(unsigned long)desc->free_blocks_hi<<16;
+		}
+		if(value)
 		{
 			return ext2_block_alloc_group(n);
 		}
@@ -544,12 +882,12 @@ unsigned int ext2_block_alloc(unsigned int inode)
 	while(n!=group);
 	return 0;
 }
-void ext2_block_release(unsigned int block)
+void ext2_block_release(unsigned long int block)
 {
-	unsigned int group;
+	unsigned long int group;
 	unsigned char buf[4096];
-	unsigned int n;
-	if(block>=ext2_sb->blocks)
+	unsigned long int n;
+	if(block>=ext2_blocks())
 	{
 		fatal_error("Block number out of range");
 	}
@@ -559,13 +897,30 @@ void ext2_block_release(unsigned int block)
 	}
 	group=block/ext2_sb->blocks_per_group;
 	n=block%ext2_sb->blocks_per_group;
-	ext2_read_block(ext2_bgdt_array[group].block_bitmap,buf);
+	struct ext4_bgdt *desc;
+	desc=(void *)((char *)ext2_bgdt_array+ext2_desc_size*group);
+	unsigned long value;
+	value=desc->block_bitmap;
+	if(ext2_desc_size>=64)
+	{
+		value+=(unsigned long)desc->block_bitmap_hi<<32;
+	}
+	ext2_read_block(value,buf);
 	bitmap_clr(buf,n);
-	ext2_write_block(ext2_bgdt_array[group].block_bitmap,buf);
-	++ext2_bgdt_array[group].free_blocks;
+	ext2_write_block(value,buf);
+	
+	++desc->free_blocks;
+	if(desc->free_blocks==0&&ext2_desc_size>=64)
+	{
+		++desc->free_blocks_hi;
+	}
 	++ext2_sb->free_blocks;
+	if(ext2_sb->free_blocks==0)
+	{
+		++ext2_sb->free_blocks_hi;
+	}
 }
-unsigned int ext2_file_alloc_block(struct ext2_file *file,unsigned int off)
+unsigned long int ext2_file_alloc_block_old(struct ext2_file *file,unsigned long int off)
 {
 	unsigned long n,n1,n2,off1,off2,off3,ret;
 	int s;
@@ -608,6 +963,10 @@ unsigned int ext2_file_alloc_block(struct ext2_file *file,unsigned int off)
 		{
 			if(file->cache_write[0]&&file->cache_block[0]!=0)
 			{
+				if(file->cache_crc[0])
+				{
+					block_update_crc(file->cache+0*1024,file->crc_seed);
+				}
 				ext2_write_block(file->cache_block[0],file->cache);
 				file->cache_write[0]=0;
 			}
@@ -659,6 +1018,10 @@ unsigned int ext2_file_alloc_block(struct ext2_file *file,unsigned int off)
 		{
 			if(file->cache_write[1]&&file->cache_block[1]!=0)
 			{
+				if(file->cache_crc[1])
+				{
+					block_update_crc(file->cache+1*1024,file->crc_seed);
+				}
 				ext2_write_block(file->cache_block[1],file->cache+1024*1);
 				file->cache_write[1]=0;
 			}
@@ -692,6 +1055,10 @@ unsigned int ext2_file_alloc_block(struct ext2_file *file,unsigned int off)
 		{
 			if(file->cache_write[2]&&file->cache_block[2]!=0)
 			{
+				if(file->cache_crc[2])
+				{
+					block_update_crc(file->cache+2*1024,file->crc_seed);
+				}
 				ext2_write_block(file->cache_block[2],file->cache+1024*2);
 				file->cache_write[2]=0;
 			}
@@ -744,6 +1111,10 @@ unsigned int ext2_file_alloc_block(struct ext2_file *file,unsigned int off)
 		{
 			if(file->cache_write[3]&&file->cache_block[3]!=0)
 			{
+				if(file->cache_crc[3])
+				{
+					block_update_crc(file->cache+3*1024,file->crc_seed);
+				}
 				ext2_write_block(file->cache_block[3],file->cache+1024*3);
 				file->cache_write[3]=0;
 			}
@@ -777,6 +1148,10 @@ unsigned int ext2_file_alloc_block(struct ext2_file *file,unsigned int off)
 		{
 			if(file->cache_write[4]&&file->cache_block[4]!=0)
 			{
+				if(file->cache_crc[4])
+				{
+					block_update_crc(file->cache+4*1024,file->crc_seed);
+				}
 				ext2_write_block(file->cache_block[4],file->cache+1024*4);
 				file->cache_write[4]=0;
 			}
@@ -810,6 +1185,10 @@ unsigned int ext2_file_alloc_block(struct ext2_file *file,unsigned int off)
 		{
 			if(file->cache_write[5]&&file->cache_block[5]!=0)
 			{
+				if(file->cache_crc[5])
+				{
+					block_update_crc(file->cache+5*1024,file->crc_seed);
+				}
 				ext2_write_block(file->cache_block[5],file->cache+1024*5);
 				file->cache_write[5]=0;
 			}
@@ -841,9 +1220,247 @@ unsigned int ext2_file_alloc_block(struct ext2_file *file,unsigned int off)
 	}
 	return 0;
 }
-int ext2_file_write(struct ext2_file *file,unsigned long off,void *buf,unsigned int size)
+unsigned long int _ext2_file_alloc_block_extent(struct ext2_file *file,void *array,int entries,int depth,unsigned long int off,int depth2)
 {
-	unsigned int bn,block,ret,size1;
+	struct ext4_extent_header *eh,*eh2;
+	struct ext4_extent *ee,*ee2;
+	struct ext4_extent_index *ei,*ei2;
+	unsigned long block;
+	unsigned int *checksum;
+	int i,alloc;
+	unsigned long val,ret;
+	
+	if(depth>5)
+	{
+		return 0;
+	}
+	eh=array;
+	if(depth2==-1)
+	{
+		depth2=eh->depth;
+	}
+	if(eh->magic!=0xf30a)
+	{
+		return 0;
+	}
+	if(eh->entries<entries)
+	{
+		entries=eh->entries;
+	}
+	if(entries==0)
+	{
+		return 0;
+	}
+	ee=(void *)(eh+1);
+	i=1;
+	while(i<entries)
+	{
+		if(ee[i].lblock>off)
+		{
+			break;
+		}
+		++i;
+	}
+	--i;
+	if(eh->depth)
+	{
+		alloc=0;
+		ei=(void *)(ee+i);
+		val=ei->block_hi&0xffff;
+		val=val<<32|ei->block_lo;
+		eh2=(void *)(file->cache+depth*1024);
+		if(val==0)
+		{
+			val=ext2_block_alloc(file->ninode);
+			if(val==0)
+			{
+				return 0;
+			}
+			file->inode.blocks+=1<<ext2_sb->block_size+1;
+			ei->block_lo=val;
+			ei->block_hi=val>>32&0xffff;
+			if(file->cache_write[depth])
+			{
+				block_update_crc(file->cache+depth*1024,file->crc_seed);
+				ext2_write_block(file->cache_block[depth],file->cache+depth*1024);
+				file->cache_write[depth]=0;
+			}
+			
+			file->cache_block[depth]=val;
+			memset(file->cache+depth*1024,0,4096);
+			alloc=1;
+			eh2->magic=0xf30a;
+			eh2->entries=1;
+			eh2->max_entries=(1<<ext2_sb->block_size+10)/12-1;
+			ei2=(void *)(eh2+1);
+			ei2->lblock=off;
+		}
+		else
+		{
+			if(file->cache_write[depth]&&file->cache_block[depth]!=val)
+			{
+				block_update_crc(file->cache+depth*1024,file->crc_seed);
+				ext2_write_block(file->cache_block[depth],file->cache+depth*1024);
+				file->cache_write[depth]=0;	
+				ext2_read_block(val,file->cache+depth*1024);
+				file->cache_block[depth]=val;
+			}
+		}
+		
+		block=_ext2_file_alloc_block_extent(file,eh2,(1<<ext2_sb->block_size+10)/12-1,depth+1,off,depth2-1);
+		if(block==0)
+		{
+			if(eh2->entries<eh2->max_entries)
+			{
+				++eh2->entries;
+				ei2=(void *)(eh2+eh2->entries);
+				ei2->lblock=off;
+				block=_ext2_file_alloc_block_extent(file,eh2,(1<<ext2_sb->block_size+10)/12-1,depth+1,off,depth2-1);
+				if(block!=0)
+				{
+					file->cache_write[depth]=1;
+					return block;
+				}
+				memset(ei2,0,sizeof(*ei2));
+				--eh2->entries;
+			}
+			if(alloc)
+			{
+				ext2_block_release(val);
+				file->inode.blocks-=1<<ext2_sb->block_size+1;
+				ei->block_lo=0;
+				ei->block_hi=0;
+			}
+			return 0;
+		}
+		file->cache_write[depth]=1;
+		return block;
+	}
+	else
+	{
+		ee+=i;
+		val=ee->start_hi;
+		val=val<<32|ee->start_lo;
+		if(val!=0)
+		{
+			if(off>=ee->lblock&&off<ee->lblock+ee->len)
+			{
+				return val+off-ee->lblock;
+			}
+			if(ee->len>=32767)
+			{
+				return 0;
+			}
+			block=ext2_block_alloc(file->ninode);
+			if(block==0)
+			{
+				return 0;
+			}
+			file->inode.blocks+=1<<ext2_sb->block_size+1;
+			if(block!=val+ee->len)
+			{
+				file->inode.blocks-=1<<ext2_sb->block_size+1;
+				ext2_block_release(block);
+				return 0;
+			}
+			ee->len+=1;
+			return block;
+		}
+		val=ext2_block_alloc(file->ninode);
+		if(val==0)
+		{
+			return 0;
+		}
+		file->inode.blocks+=1<<ext2_sb->block_size+1;
+		ee->lblock=off;
+		ee->start_lo=val;
+		ee->start_hi=val>>32;
+		ee->len=1;
+		return val;
+	}
+}
+unsigned long int ext2_file_alloc_block_extent(struct ext2_file *file,unsigned long int off)
+{
+	unsigned long ret,block;
+	struct ext4_extent_header *eh,*eh2;
+	struct ext4_extent_index *ei;
+	ret=_ext2_file_alloc_block_extent(file,file->inode.block,4,0,off,-1);
+	if(ret!=0)
+	{
+		return ret;
+	}
+	eh=(void *)file->inode.block;
+	if(eh->entries<4)
+	{
+		++eh->entries;
+		ei=(void *)(eh+eh->entries);
+		memset(ei,0,sizeof(*ei));
+		ei->lblock=off;
+		ret=_ext2_file_alloc_block_extent(file,file->inode.block,4,0,off,-1);
+		if(ret!=0)
+		{
+			return ret;
+		}
+		memset(ei,0,sizeof(*ei));
+		--eh->entries;
+		return 0;
+	}
+	block=ext2_block_alloc(file->ninode);
+	if(block==0)
+	{
+		return 0;
+	}
+	file->inode.blocks+=1<<ext2_sb->block_size+1;
+	file_store_csum(file);
+	memset(file->cache_block,0,48);
+	memset(file->cache_write,0,48);
+	memset(file->cache,0,4096);
+	memcpy(file->cache,file->inode.block,60);
+	eh=(void *)file->cache;
+	eh->entries=5;
+	eh->max_entries=(1<<ext2_sb->block_size+10)/12-1;
+	ei=(void *)(eh+eh->entries);
+	ei->lblock=off;
+	ret=_ext2_file_alloc_block_extent(file,eh,(1<<ext2_sb->block_size+10)/12-1,0,off,-1);
+	if(ret==0)
+	{
+		ext2_block_release(block);
+		file->inode.blocks-=1<<ext2_sb->block_size+1;
+		return 0;
+	}
+	file->cache_block[0]=block;
+	file->cache_write[0]=1;
+	eh2=(void *)file->inode.block;
+	memset(eh2,0,60);
+	eh2->magic=0xf30a;
+	eh2->entries=1;
+	eh2->max_entries=4;
+	eh2->depth=eh->depth+1;
+	ei=(void *)(eh2+1);
+	ei->lblock=0;
+	ei->block_lo=block;
+	ei->block_hi=block>>32&0xffff;
+	return ret;
+}
+unsigned long ext2_file_alloc_block(struct ext2_file *file,unsigned long int off)
+{
+	if(ext2_sb->feature_incompat&FEATURE_EXTENTS&&file->inode.flags&FLAG_EXTENTS)
+	{
+		unsigned long ret;
+		ret=ext2_file_alloc_block_extent(file,off);
+		return ret;
+		char buf[32];
+		buf[0]=0;
+		sprinti(buf,ret,1);
+		puts(buf);
+		puts("\n");
+		return ret;
+	}
+	return ext2_file_alloc_block_old(file,off);
+}
+int ext2_file_write(struct ext2_file *file,unsigned long off,void *buf,unsigned long int size)
+{
+	unsigned long int bn,block,ret,size1;
 	unsigned long fsize,start;
 	unsigned char buf2[4096];
 	unsigned long ctime,ctime_extra;
@@ -895,7 +1512,7 @@ int ext2_file_write(struct ext2_file *file,unsigned long off,void *buf,unsigned 
 void ext2_sync(void)
 {
 	unsigned char sb[4096];
-	unsigned int sb_block,sb_off;
+	unsigned long int sb_block,sb_off;
 	int n;
 	sb_block=0;
 	sb_off=1024;
@@ -905,16 +1522,88 @@ void ext2_sync(void)
 		sb_off=0;
 	}
 	ext2_read_block(sb_block,sb);
+	if(ext2_sb->feature_ro_compat&FEATURE_METADATA_CSUM)
+	{
+		ext2_sb->checksum=crc32(ext2_sb,1020,0xffffffff);
+	}
 	memcpy(sb+sb_off,ext2_sb,1024);
 	ext2_write_block(sb_block,sb);
 	n=0;
+	while(n<ext2_groups)
+	{
+		struct ext4_bgdt *desc;
+		desc=(void *)((char *)ext2_bgdt_array+n*ext2_desc_size);
+		desc->checksum=0;
+		unsigned int value,size;
+		unsigned long block;
+		unsigned char buf[4096];
+
+		block=desc->block_bitmap;
+		if(ext2_desc_size>=64)
+		{
+			block|=(unsigned long)desc->block_bitmap_hi<<32;
+		}
+		ext2_read_block(block,buf);
+		size=ext2_sb->blocks_per_group;
+		if(size>32768)
+		{
+			size=32768;
+		}
+		value=crc32(ext2_sb->uuid,16,0xffffffff);
+		value=crc32(buf,size>>3,value);
+		if(ext2_sb->feature_ro_compat&FEATURE_METADATA_CSUM)
+		{
+			desc->block_bitmap_csum=value;
+			if(ext2_desc_size>=64)
+			{
+				desc->block_bitmap_csum_hi=value>>16;
+			}
+		}
+
+		block=desc->inode_bitmap;
+		if(ext2_desc_size>=64)
+		{
+			block|=(unsigned long)desc->inode_bitmap_hi<<32;
+		}
+		ext2_read_block(block,buf);
+		size=ext2_sb->inodes_per_group;
+		if(size>32768)
+		{
+			size=32768;
+		}
+		value=crc32(ext2_sb->uuid,16,0xffffffff);
+		value=crc32(buf,size>>3,value);
+		if(ext2_sb->feature_ro_compat&FEATURE_METADATA_CSUM)
+		{
+			desc->inode_bitmap_csum=value;
+			if(ext2_desc_size>=64)
+			{
+				desc->inode_bitmap_csum_hi=value>>16;
+			}
+		}
+
+		value=crc32(ext2_sb->uuid,16,0xffffffff);
+		value=crc32(&n,4,value);
+		value=crc32(desc,32,value);
+		if(ext2_desc_size>=64)
+		{
+			value=crc32((char *)desc+32,32,value);
+		}
+		if(ext2_sb->feature_ro_compat&FEATURE_METADATA_CSUM)
+		{
+			desc->checksum=value;
+		}
+		++n;
+	}
+	n=0;
 	while(n<ext2_bgdt_blocks)
 	{
-		ext2_write_block(sb_block+n+1,ext2_bgdt_array+(n<<ext2_sb->block_size+5));
+		ext2_write_block(sb_block+n+1,(char *)ext2_bgdt_array+(n<<ext2_sb->block_size+10));
 		++n;
 	}
 	global_cache_flush_all();
 }
+
 long ext2_readdir(struct ext2_file *dir,long off,void *dirent)
 {
 	char buf[8];
@@ -934,7 +1623,31 @@ long ext2_readdir(struct ext2_file *dir,long off,void *dirent)
 	}
 	return off+dent->rec_len;
 }
-unsigned int ext2_search(unsigned int inode,char *name)
+void ext2_dir_write_csum(struct ext2_file *dir)
+{
+	unsigned int crc;
+	unsigned long size,off,csumoff;
+	char buf[4096];
+	if(!(ext2_sb->feature_ro_compat&FEATURE_METADATA_CSUM))
+	{
+		return;
+	}
+	size=ext2_file_size_get(dir);
+	csumoff=(1<<ext2_sb->block_size+10)-12;
+	off=0;
+	while(off<size)
+	{
+		if(ext2_file_read(dir,off<<ext2_sb->block_size+10,buf,1<<ext2_sb->block_size+10)==0)
+		{
+			return;
+		}
+		crc=crc32(buf,csumoff,dir->crc_seed);
+		*(unsigned int *)(buf+csumoff+8)=crc;
+		ext2_file_write(dir,off<<ext2_sb->block_size+10,buf,1<<ext2_sb->block_size+10);
+		off+=1;
+	}
+}
+unsigned long int ext2_search(unsigned long int inode,char *name)
 {
 	char buf[4096];
 	struct ext2_file *dir;
@@ -961,7 +1674,7 @@ unsigned int ext2_search(unsigned int inode,char *name)
 	while((off=ext2_readdir(dir,off,dirent))!=0)
 	{
 		
-		if(dirent->inode&&(unsigned int)dirent->name_len==len&&!memcmp(dirent->file_name,name,len))
+		if(dirent->inode&&(unsigned long int)dirent->name_len==len&&!memcmp(dirent->file_name,name,len))
 		{
 			ext2_file_release(dir);
 			return dirent->inode;
@@ -970,7 +1683,7 @@ unsigned int ext2_search(unsigned int inode,char *name)
 	ext2_file_release(dir);
 	return 0;
 }
-int ext2_search_path(unsigned int start_inode,char *name,unsigned int *inode)
+int ext2_search_path(unsigned long int start_inode,char *name,unsigned long int *inode)
 {
 	char buf[256],c;
 	int x;
@@ -1010,7 +1723,7 @@ int ext2_search_path(unsigned int start_inode,char *name,unsigned int *inode)
 	*inode=start_inode;
 	return 0;
 }
-int ext2_detect_file(unsigned int start_inode,char *name)
+int ext2_detect_file(unsigned long int start_inode,char *name)
 {
 	char buf[256],c;
 	int x;
@@ -1052,14 +1765,14 @@ int ext2_detect_file(unsigned int start_inode,char *name)
 	}
 	return -1;
 }
-unsigned int ext2_get_dname(unsigned int inode,char *name)
+unsigned long int ext2_get_dname(unsigned long int inode,char *name)
 {
 	char buf[4096];
 	struct ext2_file *dir;
 	struct ext2_directory *dirent;
 	long off;
 	int len;
-	unsigned int parent_inode;
+	unsigned long int parent_inode;
 	parent_inode=ext2_search(inode,"..");
 	if(parent_inode==0)
 	{
@@ -1082,8 +1795,8 @@ unsigned int ext2_get_dname(unsigned int inode,char *name)
 	{
 		if(dirent->inode==inode)
 		{
-			memcpy(name,dirent->file_name,(unsigned int)dirent->name_len);
-			name[(unsigned int)dirent->name_len]=0;
+			memcpy(name,dirent->file_name,(unsigned long int)dirent->name_len);
+			name[(unsigned long int)dirent->name_len]=0;
 			ext2_file_release(dir);
 			return parent_inode;
 		}
@@ -1091,10 +1804,10 @@ unsigned int ext2_get_dname(unsigned int inode,char *name)
 	ext2_file_release(dir);
 	return 0;
 }
-unsigned int ext2_mknod(unsigned int dir,int mode,int links)
+unsigned long int ext2_mknod(unsigned long int dir,int mode,int links)
 {
 	struct ext2_file *file;
-	unsigned int inode;
+	unsigned long int inode;
 	inode=ext2_inode_alloc(dir);
 	if(inode==0)
 	{
@@ -1111,7 +1824,7 @@ unsigned int ext2_mknod(unsigned int dir,int mode,int links)
 	ext2_file_release(file);
 	return inode;
 }
-int ext2_mkdir(unsigned int dir,unsigned int inode)
+int ext2_mkdir(unsigned long int dir,unsigned long int inode)
 {
 	struct ext2_file *file;
 	struct ext2_directory *dirent;
@@ -1130,6 +1843,15 @@ int ext2_mkdir(unsigned int dir,unsigned int inode)
 	dirent->file_type=2;
 	dirent->file_name[0]='.';
 	dirent->file_name[1]='.';
+	if(ext2_sb->feature_ro_compat&FEATURE_METADATA_CSUM)
+	{
+		dirent->rec_len=(1<<ext2_sb->block_size+10)-24;
+		dirent=(void *)((char *)dirent+dirent->rec_len);
+		dirent->inode=0;
+		dirent->rec_len=12;
+		dirent->name_len=0;
+		dirent->file_type=0xde;
+	}
 	file=ext2_file_load(inode,1,0);
 	if(file==NULL)
 	{
@@ -1143,7 +1865,7 @@ int ext2_mkdir(unsigned int dir,unsigned int inode)
 	ext2_file_release(file);
 	return 0;
 }
-int ext2_link(struct ext2_file *dir,unsigned int inode,char *name,int file_type)
+int ext2_link(struct ext2_file *dir,unsigned long int inode,char *name,int file_type)
 {
 	char buf[256],c;
 	int x,reclen;
@@ -1181,7 +1903,7 @@ int ext2_link(struct ext2_file *dir,unsigned int inode,char *name,int file_type)
 			off=0;
 			while(off=ext2_readdir(dir,off,dirent))
 			{
-				if(dirent->inode&&(unsigned int)dirent->name_len==x&&!memcmp(dirent->file_name,buf,x))
+				if(dirent->inode&&(unsigned long int)dirent->name_len==x&&!memcmp(dirent->file_name,buf,x))
 				{
 					return -1;
 				}
@@ -1190,7 +1912,7 @@ int ext2_link(struct ext2_file *dir,unsigned int inode,char *name,int file_type)
 			reclen=(x-1>>2)+3<<2;
 			while(off=ext2_readdir(dir,off,dirent))
 			{
-				if(dirent->inode==0&&dirent->rec_len>=reclen)
+				if(dirent->inode==0&&dirent->rec_len>=reclen&&dirent->file_type!=0xde)
 				{
 					off-=dirent->rec_len;
 					dirent->inode=inode;
@@ -1209,7 +1931,7 @@ int ext2_link(struct ext2_file *dir,unsigned int inode,char *name,int file_type)
 				}
 				else if(dirent->inode)
 				{
-					unsigned int l;
+					unsigned long int l;
 					l=dirent->name_len;
 					l=(l-1>>2)+3<<2;
 					if(dirent->rec_len>=l+reclen)
@@ -1241,7 +1963,9 @@ int ext2_link(struct ext2_file *dir,unsigned int inode,char *name,int file_type)
 			memset(dirent,0,4096);
 			dirent->inode=inode;
 			dirent->rec_len=1<<ext2_sb->block_size+10;
+			
 			dirent->name_len=x;
+			
 			if(ext2_sb->feature_incompat&2)
 			{
 				dirent->file_type=file_type;
@@ -1251,7 +1975,16 @@ int ext2_link(struct ext2_file *dir,unsigned int inode,char *name,int file_type)
 				dirent->file_type=0;
 			}
 			memcpy(dirent->file_name,buf,x);
-			if(ext2_file_write(dir,off,dirent,dirent->rec_len)!=dirent->rec_len)
+			if(ext2_sb->feature_ro_compat&FEATURE_METADATA_CSUM)
+			{
+				dirent->rec_len-=12;
+				dirent=(void *)((char *)dirent+dirent->rec_len);
+				dirent->inode=0;
+				dirent->rec_len=12;
+				dirent->name_len=0;
+				dirent->file_type=0xde;
+			}
+			if(ext2_file_write(dir,off,buf2,1<<ext2_sb->block_size+10)!=1<<ext2_sb->block_size+10)
 			{
 				return -1;
 			}
@@ -1261,14 +1994,14 @@ int ext2_link(struct ext2_file *dir,unsigned int inode,char *name,int file_type)
 	return -1;
 }
 
-unsigned int ext2_unlink(struct ext2_file *dir,char *name)
+unsigned long int ext2_unlink(struct ext2_file *dir,char *name)
 {
 	char buf[256],c;
 	int x;
 	char buf2[4096];
 	struct ext2_directory *dirent;
 	long off;
-	unsigned int inode;
+	unsigned long int inode;
 	if(*name=='/')
 	{
 		while(*name=='/')
@@ -1300,7 +2033,7 @@ unsigned int ext2_unlink(struct ext2_file *dir,char *name)
 			off=0;
 			while(off=ext2_readdir(dir,off,dirent))
 			{
-				if(dirent->inode&&(unsigned int)dirent->name_len==x&&!memcmp(dirent->file_name,buf,x))
+				if(dirent->inode&&(unsigned long int)dirent->name_len==x&&!memcmp(dirent->file_name,buf,x))
 				{
 					off-=dirent->rec_len;
 					inode=dirent->inode;
@@ -1316,7 +2049,7 @@ unsigned int ext2_unlink(struct ext2_file *dir,char *name)
 	}
 	return 0;
 }
-unsigned int ext2_dir_inode(unsigned int start_inode,char *name)
+unsigned long int ext2_dir_inode(unsigned long int start_inode,char *name)
 {
 	char buf[256],c;
 	int x;
@@ -1401,9 +2134,9 @@ int ext2_is_special_entry(char *name)
 	}
 	return -1;
 }
-int ext2_mkdir_path(unsigned int dir,char *path)
+int ext2_mkdir_path(unsigned long int dir,char *path)
 {
-	unsigned int inode,diri,group;
+	unsigned long int inode,diri,group;
 	struct ext2_file *file;
 	if(ext2_detect_file(dir,path))
 	{
@@ -1419,7 +2152,7 @@ int ext2_mkdir_path(unsigned int dir,char *path)
 	{
 		return -1;
 	}
-	if(file->inode.links==65535)
+	if(file->inode.links==65535||file->inode.links==1)
 	{
 		ext2_file_release(file);
 		return -1;
@@ -1431,7 +2164,9 @@ int ext2_mkdir_path(unsigned int dir,char *path)
 		return -1;
 	}
 	group=(inode-1)/ext2_sb->inodes_per_group;
-	if(ext2_bgdt_array[group].used_dirs==65535)
+	struct ext4_bgdt *desc;
+	desc=(void *)((char *)ext2_bgdt_array+ext2_desc_size*group);
+	if(desc->used_dirs==65535)
 	{
 		ext2_file_release(file);
 		ext2_inode_release(inode);
@@ -1451,11 +2186,11 @@ int ext2_mkdir_path(unsigned int dir,char *path)
 		return -1;
 	}
 	++file->inode.links;
-	++ext2_bgdt_array[group].used_dirs;
+	++desc->used_dirs;
 	ext2_file_release(file);
 	return 0;
 }
-void ext2_release_blocks(unsigned int n,unsigned int level)
+void ext2_release_blocks_old(unsigned long int n,unsigned long int level)
 {
 	unsigned int buf[1024];
 	int x;
@@ -1469,24 +2204,123 @@ void ext2_release_blocks(unsigned int n,unsigned int level)
 		x=0;
 		while(x<1<<ext2_sb->block_size+8)
 		{
-			ext2_release_blocks(buf[x],level-1);
+			ext2_release_blocks_old(buf[x],level-1);
 			++x;
 		}
 	}
 	ext2_block_release(n);
 }
-void ext2_release_file_blocks(struct ext2_file *file)
+void ext2_release_file_blocks_old(struct ext2_file *file)
 {
 	int x;
 	x=0;
 	while(x<12)
 	{
-		ext2_release_blocks(file->inode.block[x],0);
+		ext2_release_blocks_old(file->inode.block[x],0);
 		++x;
 	}
-	ext2_release_blocks(file->inode.block[12],1);
-	ext2_release_blocks(file->inode.block[13],2);
-	ext2_release_blocks(file->inode.block[14],3);
+	ext2_release_blocks_old(file->inode.block[12],1);
+	ext2_release_blocks_old(file->inode.block[13],2);
+	ext2_release_blocks_old(file->inode.block[14],3);
+	
+}
+void ext2_release_blocks_extent(unsigned long int n,int depth)
+{
+	char buf[4096];
+	struct ext4_extent_header *eh;
+	struct ext4_extent *ee;
+	struct ext4_extent_index *ei;
+	unsigned long val;
+	if(depth>5)
+	{
+		return;
+	}
+	int i,j;
+	ext2_read_block(n,buf);
+	eh=(void *)buf;
+	i=0;
+	if(eh->depth)
+	{
+		ei=(void *)(eh+1);
+		while(i<eh->entries&&i<(1<<ext2_sb->block_size+10)/12-1)
+		{
+			val=ei[i].block_hi&0xffff;
+			val=val<<32|ei[i].block_lo;
+			ext2_release_blocks_extent(val,depth+1);
+			++i;
+		}
+	}
+	else
+	{
+		ee=(void *)(eh+1);
+		while(i<eh->entries&&i<(1<<ext2_sb->block_size+10)/12-1)
+		{
+			val=ee[i].start_hi&0xffff;
+			val=val<<32|ee[i].start_lo;
+			if(!(ee[i].len&0x8000))
+			{
+				j=0;
+				while(j<ee[i].len)
+				{
+					ext2_block_release(val+j);
+					++j;
+				}
+			}
+			++i;
+		}
+	}
+	ext2_block_release(n);
+}
+void ext2_release_file_blocks_extent(struct ext2_file *file)
+{
+	struct ext4_extent_header *eh;
+	struct ext4_extent *ee;
+	struct ext4_extent_index *ei;
+	unsigned long val;
+	int i,j;
+	eh=(void *)file->inode.block;
+	i=0;
+	if(eh->depth)
+	{
+		ei=(void *)(eh+1);
+		while(i<eh->entries&&i<4)
+		{
+			val=ei[i].block_hi&0xffff;
+			val=val<<32|ei[i].block_lo;
+			ext2_release_blocks_extent(val,0);
+			++i;
+		}
+	}
+	else
+	{
+		ee=(void *)(eh+1);
+		while(i<eh->entries&&i<4)
+		{
+			val=ee[i].start_hi&0xffff;
+			val=val<<32|ee[i].start_lo;
+			j=0;
+			if(!(ee[i].len&0x8000))
+			{
+				while(j<ee[i].len)
+				{
+					ext2_block_release(val+j);
+					++j;
+				}
+			}
+			++i;
+		}
+	}
+}
+void ext2_release_file_blocks(struct ext2_file *file)
+{
+	if(ext2_sb->feature_incompat&FEATURE_EXTENTS&&file->inode.flags&FLAG_EXTENTS)
+	{
+		ext2_release_file_blocks_extent(file);
+	}
+	else
+	{
+		ext2_release_file_blocks_old(file);
+	}
 	file->inode.blocks=0;
 	file->inode.size=0;
 	memset(file->inode.block,0,sizeof(file->inode.block));
