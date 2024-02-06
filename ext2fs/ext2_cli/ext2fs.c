@@ -1446,15 +1446,7 @@ unsigned long ext2_file_alloc_block(struct ext2_file *file,unsigned long int off
 {
 	if(ext2_sb->feature_incompat&FEATURE_EXTENTS&&file->inode.flags&FLAG_EXTENTS)
 	{
-		unsigned long ret;
-		ret=ext2_file_alloc_block_extent(file,off);
-		return ret;
-		char buf[32];
-		buf[0]=0;
-		sprinti(buf,ret,1);
-		puts(buf);
-		puts("\n");
-		return ret;
+		return ext2_file_alloc_block_extent(file,off);
 	}
 	return ext2_file_alloc_block_old(file,off);
 }
