@@ -95,7 +95,7 @@ void ext2fs_init(char *name)
 	{
 		fatal_error("Bad block or inode number");
 	}
-	if(ext2_sb->feature_incompat&~0x2c2||ext2_sb->feature_ro_compat&~0x46b)
+	if(ext2_sb->feature_incompat&~0x22c2||ext2_sb->feature_ro_compat&~0x46b)
 	{
 		fatal_error("Filesystem has unsupported features");
 	}
@@ -218,7 +218,14 @@ struct ext2_file *ext2_file_load(unsigned long int ninode,unsigned long int writ
 		ext2_write_block(inode_block,buf);
 	}
 	unsigned int crc;
-	crc=crc32(ext2_sb->uuid,16,0xffffffff);
+	if(ext2_sb->feature_incompat&FEATURE_CSUM_SEED)
+	{
+		crc=ext2_sb->csum_seed;
+	}
+	else
+	{
+		crc=crc32(ext2_sb->uuid,16,0xffffffff);
+	}
 	crc=crc32(&ninode,4,crc);
 	crc=crc32(&file->inode.generation,4,crc);
 	if(ext2_sb->feature_incompat&FEATURE_EXTENTS&&file->inode.flags&FLAG_EXTENTS)
@@ -283,7 +290,14 @@ void ext2_file_release(struct ext2_file *file)
 	if(ext2_sb->feature_ro_compat&FEATURE_METADATA_CSUM)
 	{
 		unsigned int csum;
-		csum=crc32(ext2_sb->uuid,16,0xffffffff);
+		if(ext2_sb->feature_incompat&FEATURE_CSUM_SEED)
+		{
+			csum=ext2_sb->csum_seed;
+		}
+		else
+		{
+			csum=crc32(ext2_sb->uuid,16,0xffffffff);
+		}
 		csum=crc32(&ninode,4,csum);
 		csum=crc32(&file->inode.generation,4,csum);
 		file->inode.osd2[2]=0;
@@ -1541,7 +1555,14 @@ void ext2_sync(void)
 		{
 			size=32768;
 		}
-		value=crc32(ext2_sb->uuid,16,0xffffffff);
+		if(ext2_sb->feature_incompat&FEATURE_CSUM_SEED)
+		{
+			value=ext2_sb->csum_seed;
+		}
+		else
+		{
+			value=crc32(ext2_sb->uuid,16,0xffffffff);
+		}
 		value=crc32(buf,size>>3,value);
 		if(ext2_sb->feature_ro_compat&FEATURE_METADATA_CSUM)
 		{
@@ -1563,7 +1584,14 @@ void ext2_sync(void)
 		{
 			size=32768;
 		}
-		value=crc32(ext2_sb->uuid,16,0xffffffff);
+		if(ext2_sb->feature_incompat&FEATURE_CSUM_SEED)
+		{
+			value=ext2_sb->csum_seed;
+		}
+		else
+		{
+			value=crc32(ext2_sb->uuid,16,0xffffffff);
+		}
 		value=crc32(buf,size>>3,value);
 		if(ext2_sb->feature_ro_compat&FEATURE_METADATA_CSUM)
 		{
@@ -1574,7 +1602,14 @@ void ext2_sync(void)
 			}
 		}
 
-		value=crc32(ext2_sb->uuid,16,0xffffffff);
+		if(ext2_sb->feature_incompat&FEATURE_CSUM_SEED)
+		{
+			value=ext2_sb->csum_seed;
+		}
+		else
+		{
+			value=crc32(ext2_sb->uuid,16,0xffffffff);
+		}
 		value=crc32(&n,4,value);
 		value=crc32(desc,32,value);
 		if(ext2_desc_size>=64)

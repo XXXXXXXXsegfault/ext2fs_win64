@@ -54,7 +54,9 @@ struct ext2_superblock
 	unsigned int blocks_hi;
 	unsigned int r_blocks_hi;
 	unsigned int free_blocks_hi;
-	unsigned int rsv[168];
+	unsigned int rsv[69];
+	unsigned int csum_seed;
+	unsigned int rsv2[98];
 	
 	unsigned int checksum;
 };
@@ -135,6 +137,7 @@ struct ext2_directory
 
 #define FEATURE_EXTENTS 0x40
 #define FEATURE_64BIT 0x80
+#define FEATURE_CSUM_SEED 0x2000
 
 #define FEATURE_METADATA_CSUM 0x400
 #define FEATURE_DIR_NLINK 0x20
