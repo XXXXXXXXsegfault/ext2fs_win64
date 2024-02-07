@@ -221,7 +221,7 @@ struct ext2_file *ext2_file_load(unsigned long int ninode,unsigned long int writ
 	crc=crc32(ext2_sb->uuid,16,0xffffffff);
 	crc=crc32(&ninode,4,crc);
 	crc=crc32(&file->inode.generation,4,crc);
-	if(ext2_sb->feature_incompat&FEATURE_EXTENTS)
+	if(ext2_sb->feature_incompat&FEATURE_EXTENTS&&file->inode.flags&FLAG_EXTENTS)
 	{
 		file->cache_crc[0]=1;
 		file->cache_crc[1]=1;
