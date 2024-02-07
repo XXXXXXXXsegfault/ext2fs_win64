@@ -23,10 +23,6 @@ unsigned long read_raw_blocks(void *buf,unsigned long off,unsigned long size)
 	ReadFile(dev_handle,buf,size<<12,&ret,NULL);
 	if(ret!=size<<12)
 	{
-		char buf[20];
-		buf[0]=0;
-		sprinti(buf,size,1);
-		puts(buf);
 		fatal_error("I/O error while reading blocks");
 	}
 	return size;
