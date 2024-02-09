@@ -54,9 +54,13 @@ struct ext2_superblock
 	unsigned int blocks_hi;
 	unsigned int r_blocks_hi;
 	unsigned int free_blocks_hi;
-	unsigned int rsv[69];
+	unsigned int rsv[6];
+	unsigned char pad2;
+	unsigned char csum_type;
+	unsigned char pad3[2];
+	unsigned int rsv2[62];
 	unsigned int csum_seed;
-	unsigned int rsv2[98];
+	unsigned int rsv3[98];
 	
 	unsigned int checksum;
 };

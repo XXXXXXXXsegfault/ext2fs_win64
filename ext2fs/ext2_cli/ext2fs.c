@@ -657,7 +657,7 @@ unsigned long int ext2_inode_alloc_group(unsigned long group)
 	}
 	
 	--desc->free_inodes;
-	if(ext2_desc_size>=64||ext2_sb->feature_ro_compat&FEATURE_METADATA_CSUM)
+	if(ret-group*ext2_sb->inodes_per_group+desc->unused_inodes>ext2_sb->inodes_per_group)
 	{
 		if(desc->unused_inodes==0&&ext2_desc_size>=64)
 		{
@@ -773,14 +773,6 @@ void ext2_inode_release(unsigned long inode)
 	ext2_write_block(block,buf);
 	++desc->free_inodes;
 	++ext2_sb->free_inodes;
-	if(ext2_desc_size>=64||ext2_sb->feature_ro_compat&FEATURE_METADATA_CSUM)
-	{
-		++desc->unused_inodes;
-		if(desc->unused_inodes==0&&ext2_desc_size>=64)
-		{
-			++desc->unused_inodes_hi;
-		}
-	}
 	if(ext2_desc_size>=64&&desc->free_inodes==0)
 	{
 		++desc->free_inodes;
