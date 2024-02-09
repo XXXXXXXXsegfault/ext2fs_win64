@@ -337,7 +337,7 @@ void write_first_group(void)
 	buf_write(block_bitmap,4096);
 	buf_write(inode_bitmap,4096);
 	buf_write_zero(256);
-	memset(&inode,0,128);
+	memset(&inode,0,256);
 	inode.mode=040755;
 	inode.links=2;
 	inode.size=4096;
@@ -354,8 +354,8 @@ void write_first_group(void)
 	inode.ctime_extra=ctime_extra;
 	inode.mtime_extra=ctime_extra;
 	inode.crtime_extra=ctime_extra;
-	buf_write(&inode,sizeof(inode));
-	buf_write_zero(256-sizeof(inode)+256*8190);
+	buf_write(&inode,256);
+	buf_write_zero(256*8190);
 	memset(buf,0,12);
 	dir=(void *)buf;
 	dir->inode=2;
