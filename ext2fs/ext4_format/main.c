@@ -14,7 +14,7 @@ unsigned char block_bitmap[4096];
 unsigned char inode_bitmap[4096];
 void fatal_error(char *str)
 {
-	puts("Fatal Error: ");
+	puts("\nFatal Error: ");
 	puts(str);
 	exit(1);
 }
@@ -476,5 +476,6 @@ int main(int argc,char **argv)
 		++i;
 		print_progress(groups,i);
 	}
+	puts("\nSuccess\n");
 	return 0;
 }
